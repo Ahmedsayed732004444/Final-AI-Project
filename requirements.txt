@@ -1,3 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
 fastapi
 uvicorn
 pydantic
@@ -9,9 +11,9 @@ groq
 sqlalchemy
 pyodbc
 python-dotenv
-slowapi         
-redis         
-tenacity   
-pypdf        
-python-docx        
-python-multipart   
+slowapi
+redis
+tenacity
+pypdf
+python-docx
+python-multipart
