@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+pydantic
+sentence-transformers
+scikit-learn
+rapidfuzz
+numpy
+groq
+sqlalchemy
+pyodbc
+python-dotenv
+slowapi         
+redis         
+tenacity   
+pypdf        
+python-docx        
+python-multipart   
