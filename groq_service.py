@@ -177,8 +177,8 @@ def _roadmap_meta(avg_match: float) -> tuple[str, int]:
 
 def _get_token_budget(weeks: int) -> int:
     """Estimate required tokens; cap at model max."""
-    estimated = weeks * 350   # ~350 tokens per week module
-    return min(max(estimated, 2000), 8192)
+    estimated = weeks * 200   # ⚡ Reduced: 350→200 tokens per week (faster response)
+    return min(max(estimated, 1500), 4096)  # ⚡ Cap at 4096 instead of 8192
 
 
 # ─── Groq call with retry + timeout ──────────────────────────────────────────
@@ -418,8 +418,8 @@ def _generate_split(user_skills, jobs_data, domain, system, token_budget) -> dic
     # ⚡ Run both Groq calls in PARALLEL — cuts 12-week roadmap time in half
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=2) as executor:
-        f1 = executor.submit(_call_groq, [{"role":"system","content":system},{"role":"user","content":p1}], 4096)
-        f2 = executor.submit(_call_groq, [{"role":"system","content":system},{"role":"user","content":p2}], 4096)
+        f1 = executor.submit(_call_groq, [{"role":"system","content":system},{"role":"user","content":p1}], 2048)
+        f2 = executor.submit(_call_groq, [{"role":"system","content":system},{"role":"user","content":p2}], 2048)
         raw1 = f1.result()
         raw2 = f2.result()
 
