@@ -67,6 +67,12 @@ class Database:
     No table creation here — EF Core owns all schema migrations.
     """
 
+    def __init__(self) -> None:
+        # In-memory cache for frequently read data (e.g., user skills).
+        # Safe across requests within the same process and provides a
+        # lightweight fallback if the database becomes temporarily unavailable.
+        self._skills_cache: dict[str, list] = {}
+
     # ═══════════════════════════════════════════════════════════════════════════
     # FEATURE 1 — CV Parsing → ModelExtrations + Education + Experience
     # ═══════════════════════════════════════════════════════════════════════════
@@ -136,29 +142,33 @@ class Database:
                 if model_extration_id is None:
                     raise RuntimeError("Failed to retrieve inserted ModelExtration Id")
 
-                # ── 3. Insert Education rows ──────────────────────────────────
+                # ── 3. Insert Education rows (bulk) ───────────────────────────
                 # C# Education: Degree, Field, Institution, Year (all strings)
-                for edu in analysis.get("education", []):
-                    cur.execute("""
-                        INSERT INTO Education
-                            (ModelExtrationId, Degree, Field, Institution, Year)
-                        VALUES (?, ?, ?, ?, ?)
-                    """,
+                education_rows = [
+                    (
                         model_extration_id,
                         edu.get("degree", ""),
                         edu.get("field") or "",
                         edu.get("institution", ""),
                         str(edu.get("graduation_year") or ""),
                     )
+                    for edu in analysis.get("education", [])
+                ]
+                if education_rows:
+                    cur.fast_executemany = True
+                    cur.executemany(
+                        """
+                        INSERT INTO Education
+                            (ModelExtrationId, Degree, Field, Institution, Year)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        education_rows,
+                    )
 
-                # ── 4. Insert Experience rows ─────────────────────────────────
+                # ── 4. Insert Experience rows (bulk) ──────────────────────────
                 # C# Experience: JobTitle, Company, StartDate, EndDate, Description
-                for exp in analysis.get("experience", []):
-                    cur.execute("""
-                        INSERT INTO Experience
-                            (ModelExtrationId, JobTitle, Company, StartDate, EndDate, Description)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """,
+                experience_rows = [
+                    (
                         model_extration_id,
                         exp.get("job_title", ""),
                         exp.get("company") or "N/A",
@@ -166,8 +176,22 @@ class Database:
                         exp.get("end_date") or "",
                         exp.get("responsibilities") or "",
                     )
+                    for exp in analysis.get("experience", [])
+                ]
+                if experience_rows:
+                    cur.fast_executemany = True
+                    cur.executemany(
+                        """
+                        INSERT INTO Experience
+                            (ModelExtrationId, JobTitle, Company, StartDate, EndDate, Description)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        experience_rows,
+                    )
 
                 conn.commit()
+                # Warm the in-memory skills cache with latest skills
+                self._skills_cache[application_user_id] = analysis.get("skills", []) or []
                 logger.info(
                     f"CV saved → ModelExtrations.Id={model_extration_id}, "
                     f"user={application_user_id}"
@@ -176,6 +200,7 @@ class Database:
 
         except Exception as e:
             logger.error(f"upsert_cv_data error: {e}")
+            # Fallback: leave cache untouched and signal failure to caller
             return {"saved": False, "message": f"DB error: {e}"}
 
     def get_user_skills(self, user_id: str) -> List[str]:
@@ -183,6 +208,11 @@ class Database:
         Read Skills JSON string from ModelExtrations and return as a Python list.
         Returns [] if the user has no CV record yet.
         """
+        # Fast path: serve from in-memory cache when available
+        cached = self._skills_cache.get(user_id)
+        if cached is not None:
+            return list(cached)
+
         try:
             with _get_connection() as conn:
                 cur = conn.cursor()
@@ -192,11 +222,18 @@ class Database:
                 )
                 row = cur.fetchone()
                 if row and row[0]:
-                    return json.loads(row[0])
+                    skills = json.loads(row[0])
+                    # Cache result for subsequent requests
+                    self._skills_cache[user_id] = skills or []
+                    return skills
+                # Cache negative lookups to avoid repeated DB hits
+                self._skills_cache[user_id] = []
                 return []
         except Exception as e:
             logger.error(f"get_user_skills error: {e}")
-            return []
+            # Fallback to last known cached value (if any)
+            cached = self._skills_cache.get(user_id)
+            return list(cached) if cached is not None else []
 
     # ═══════════════════════════════════════════════════════════════════════════
     # FEATURE 2 — Job Matching Roadmap → RoadmapJsons
@@ -278,11 +315,15 @@ class Database:
                     options_dict  = q.get("options", {})
 
                     # ── Insert JobInterview row ───────────────────────────────
-                    cur.execute("""
+                    cur.execute(
+                        """
                         INSERT INTO JobInterviews (Question, JobId)
                         OUTPUT INSERTED.Id
                         VALUES (?, ?)
-                    """, question_text, job_id)
+                        """,
+                        question_text,
+                        job_id,
+                    )
                     ji_row = cur.fetchone()
                     ji_id  = ji_row[0] if ji_row else None
 
@@ -291,15 +332,20 @@ class Database:
 
                     last_id = ji_id
 
-                    # ── Insert 4 JobInterviewOption rows ──────────────────────
-                    for option_key in ["A", "B", "C", "D"]:
-                        option_text = options_dict.get(option_key, "")
-                        is_correct  = (option_key == correct_key)
-                        cur.execute("""
-                            INSERT INTO JobInterviewOption
-                                (JobInterviewId, OptionText, IsCorrect)
-                            VALUES (?, ?, ?)
-                        """, ji_id, option_text, 1 if is_correct else 0)
+                    # ── Insert 4 JobInterviewOption rows (bulk per question) ──
+                    option_rows = [
+                        (ji_id, options_dict.get(option_key, ""), 1 if option_key == correct_key else 0)
+                        for option_key in ["A", "B", "C", "D"]
+                    ]
+                    cur.fast_executemany = True
+                    cur.executemany(
+                        """
+                        INSERT INTO JobInterviewOption
+                            (JobInterviewId, OptionText, IsCorrect)
+                        VALUES (?, ?, ?)
+                        """,
+                        option_rows,
+                    )
 
                 conn.commit()
                 logger.info(

@@ -5,12 +5,23 @@ Orchestrates file parsing and LLM-based CV analysis.
 
 import logging
 import json
-import re
+import os
 from typing import Dict, Any
+
+from dotenv import load_dotenv
+from groq import Groq
 
 from file_parser import FileParser
 
 logger = logging.getLogger(__name__)
+
+load_dotenv()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Tight but safe defaults for this structured JSON task
+GROQ_TIMEOUT = 20
+GROQ_MAX_TOKENS = 2048
+GROQ_MAX_RETRIES = 2
+_groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
 def safe_json_parse(content: str) -> Dict[str, Any]:
@@ -57,14 +68,6 @@ class CVAnalyzer:
 
     def _analyze_with_groq(self, cv_text: str) -> Dict[str, Any]:
         """Send CV text to Groq and return structured data."""
-        from groq import Groq
-        import os
-        from dotenv import load_dotenv
-
-        load_dotenv()
-        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-        model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-
         prompt = f"""Extract structured information from the following CV text. Return ONLY valid JSON with this exact structure:
 
 {{
@@ -108,32 +111,26 @@ CV Text:
 
 Return ONLY the JSON object, no additional text."""
 
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=4096,
-                timeout=45,
-            )
-            content = response.choices[0].message.content
-            parsed = safe_json_parse(content)
-
-        except Exception as e:
-            logger.warning(f"First Groq attempt failed: {e}. Retrying…")
+        last_error: Exception | None = None
+        for attempt in range(1, GROQ_MAX_RETRIES + 1):
             try:
-                response = client.chat.completions.create(
-                    model=model,
+                response = _groq_client.chat.completions.create(
+                    model=GROQ_MODEL,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
-                    max_tokens=4096,
-                    timeout=45,
+                    max_tokens=GROQ_MAX_TOKENS,
+                    timeout=GROQ_TIMEOUT,
                 )
                 content = response.choices[0].message.content
                 parsed = safe_json_parse(content)
-            except Exception as retry_err:
-                logger.error(f"Groq retry failed: {retry_err}")
-                raise ValueError(f"LLM service failed: {retry_err}")
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < GROQ_MAX_RETRIES:
+                    logger.warning(f"Groq CV analysis attempt {attempt}/{GROQ_MAX_RETRIES} failed: {e}. Retrying…")
+                else:
+                    logger.error(f"Groq CV analysis failed after {GROQ_MAX_RETRIES} attempts: {e}")
+                    raise ValueError(f"LLM service failed: {e}")
 
         # Ensure defaults
         parsed.setdefault("languages", [])

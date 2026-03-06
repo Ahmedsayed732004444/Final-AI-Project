@@ -14,7 +14,6 @@ import json
 import os
 import re
 import time
-import asyncio
 import logging
 from collections import Counter
 from dotenv import load_dotenv

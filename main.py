@@ -17,6 +17,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from pydantic import BaseModel, validator, Field
 from typing import List, Optional
 from contextlib import asynccontextmanager
+import asyncio
 import json
 import logging
 
@@ -140,7 +141,8 @@ async def upload_cv(
     # ── Step 1: Parse CV ──────────────────────────────────────────────────────
     try:
         analyzer = CVAnalyzer()
-        analysis = analyzer.analyze(file_content, file_extension)
+        # Offload blocking CV + LLM analysis to a worker thread
+        analysis = await asyncio.to_thread(analyzer.analyze, file_content, file_extension)
     except ValueError as ve:
         logger.error(f"CV analysis validation error: {ve}")
         raise HTTPException(status_code=400, detail=str(ve))
@@ -166,7 +168,8 @@ async def upload_cv(
     database_saved = False
     message        = "CV analyzed successfully"
     try:
-        db_result      = db.upsert_cv_data(analysis, application_user_id)
+        # Offload blocking DB operations to a worker thread
+        db_result      = await asyncio.to_thread(db.upsert_cv_data, analysis, application_user_id)
         database_saved = db_result.get("saved", False)
         message        = db_result.get("message", message)
     except Exception as db_err:
@@ -175,7 +178,8 @@ async def upload_cv(
 
     # ── Step 4: Generate GROQ review ──────────────────────────────────────────
     try:
-        cv_review = generate_cv_review(analysis)
+        # Offload blocking Groq API call to a worker thread
+        cv_review = await asyncio.to_thread(generate_cv_review, analysis)
     except Exception as review_err:
         logger.error(f"CV review generation error: {review_err}")
         cv_review = "Review generation failed. Please retry."
@@ -265,7 +269,8 @@ async def match_jobs(
     Generates a personalized learning roadmap and saves it to DB.
     """
     # ── Resolve user skills (from DB, fall back to request body) ─────────────
-    user_skills = db.get_user_skills(body.user_id)
+    # Offload blocking DB access to a worker thread
+    user_skills = await asyncio.to_thread(db.get_user_skills, body.user_id)
     if not user_skills:
         # fall back to skills provided in request (if any)
         user_skills = [s.strip() for s in body.user_skills if s.strip()]
@@ -281,28 +286,40 @@ async def match_jobs(
     logger.info(f"[{body.user_id}] Processing {len(body.jobs)} jobs with {len(user_skills)} skills")
 
     # ── Step 1: Score all jobs ────────────────────────────────────────────────
-    scored_jobs = []
-    for job in body.jobs:
-        semantic         = embedder.semantic_score(user_skills, job.job_skills)
-        fuzz             = fuzzy_score(user_skills, job.job_skills)
-        matched, missing = get_matched_missing(user_skills, job.job_skills)
-        score            = hybrid_score(semantic, fuzz, len(matched), len(job.job_skills))
+    # Offload CPU-heavy embedding + scoring to a worker thread
+    def _score_jobs() -> list[dict]:
+        # ⚡ Pre-compute user embedding ONCE instead of inside every loop iteration
+        user_vec = embedder.embed_list(user_skills).reshape(1, -1)
 
-        scored_jobs.append({
-            "job_id":           job.job_id,
-            "title":            job.job_title,
-            "description":      job.job_description,
-            "match_percentage": score,
-            "matched":          matched,
-            "missing":          missing,
-        })
+        from sklearn.metrics.pairwise import cosine_similarity
+        import numpy as np
 
-    scored_jobs.sort(key=lambda x: x["match_percentage"], reverse=True)
+        scored: list[dict] = []
+        for job in body.jobs:
+            job_vec          = embedder.embed_list(job.job_skills).reshape(1, -1)
+            semantic         = float(np.clip(cosine_similarity(user_vec, job_vec)[0][0], 0.0, 1.0))
+            fuzz             = fuzzy_score(user_skills, job.job_skills)
+            matched, missing = get_matched_missing(user_skills, job.job_skills)
+            score            = hybrid_score(semantic, fuzz, len(matched), len(job.job_skills))
+
+            scored.append({
+                "job_id":           job.job_id,
+                "title":            job.job_title,
+                "description":      job.job_description,
+                "match_percentage": score,
+                "matched":          matched,
+                "missing":          missing,
+            })
+        scored.sort(key=lambda x: x["match_percentage"], reverse=True)
+        return scored
+
+    scored_jobs = await asyncio.to_thread(_score_jobs)
     logger.info(f"[{body.user_id}] Scoring done.")
 
     # ── Step 2: Generate personalized roadmap ────────────────────────────────
     try:
-        roadmap = generate_general_prompt(user_skills, scored_jobs)
+        # Offload blocking Groq API call to a worker thread
+        roadmap = await asyncio.to_thread(generate_general_prompt, user_skills, scored_jobs)
     except Exception as e:
         logger.error(f"[{body.user_id}] Groq roadmap generation failed: {e}")
         raise HTTPException(502, f"LLM service error: {e}")
@@ -316,10 +333,12 @@ async def match_jobs(
         roadmap["modules"] = roadmap["modules"][:6]
 
     try:
-        prompt_db_id = db.save_prompt_roadmap(
-            title=roadmap.get("roadmap_title", "Roadmap"),
-            description=roadmap,
-            user_id=body.user_id,
+        # Offload blocking DB insert to a worker thread
+        prompt_db_id = await asyncio.to_thread(
+            db.save_prompt_roadmap,
+            roadmap.get("roadmap_title", "Roadmap"),
+            roadmap,
+            body.user_id,
         )
     except Exception as e:
         logger.error(f"[{body.user_id}] DB save roadmap error: {e}")
@@ -385,17 +404,20 @@ async def generate_interview_questions_endpoint(
 
     # ── Generate questions via GROQ ───────────────────────────────────────────
     try:
-        questions = generate_interview_questions(job.dict())
+        # Offload blocking Groq API call to a worker thread
+        questions = await asyncio.to_thread(generate_interview_questions, job.dict())
     except Exception as e:
         logger.error(f"Interview question generation error: {e}")
         raise HTTPException(502, f"LLM service error: {e}")
 
     # ── Save to DB ────────────────────────────────────────────────────────────
     try:
-        saved_id = db.save_interview_questions(
-            job_id    = job.job_id,
-            job_title = job.job_title,
-            questions = questions,
+        # Offload blocking DB writes to a worker thread
+        saved_id = await asyncio.to_thread(
+            db.save_interview_questions,
+            job.job_id,
+            job.job_title,
+            questions,
         )
     except Exception as e:
         logger.error(f"Interview questions DB save error: {e}")
