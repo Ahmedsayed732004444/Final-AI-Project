@@ -14,6 +14,7 @@ import json
 import os
 import re
 import time
+import asyncio
 import logging
 from collections import Counter
 from dotenv import load_dotenv
@@ -25,8 +26,8 @@ client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 MAX_SKILL_LEN     = 80    # Fix #6: cap individual skill length
 MAX_SKILLS_PROMPT = 40    # max skills shown in prompt
-GROQ_TIMEOUT      = 45    # Fix #4: seconds
-MAX_RETRIES       = 3     # Fix #8: retry attempts
+GROQ_TIMEOUT      = 20    # ⚡ Reduced: 45→20s (fast model, shouldn't need more)
+MAX_RETRIES       = 2     # ⚡ Reduced: 3→2 retries (saves 14s of sleep on failure)
 
 
 # ─── Fix #6: Input sanitization ───────────────────────────────────────────────
@@ -414,8 +415,13 @@ def _generate_split(user_skills, jobs_data, domain, system, token_budget) -> dic
     p1 = _partial_prompt(half1, 1,      half,  False)
     p2 = _partial_prompt(half2, half+1, weeks, True)
 
-    raw1 = _call_groq([{"role":"system","content":system},{"role":"user","content":p1}], 4096)
-    raw2 = _call_groq([{"role":"system","content":system},{"role":"user","content":p2}], 4096)
+    # ⚡ Run both Groq calls in PARALLEL — cuts 12-week roadmap time in half
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(_call_groq, [{"role":"system","content":system},{"role":"user","content":p1}], 4096)
+        f2 = executor.submit(_call_groq, [{"role":"system","content":system},{"role":"user","content":p2}], 4096)
+        raw1 = f1.result()
+        raw2 = f2.result()
 
     modules1 = json.loads(_strip_fences(raw1))
     modules2 = json.loads(_strip_fences(raw2))
